@@ -1,0 +1,21 @@
+[Unit]
+Description=UGREEN DXP480T power LED (UGOS-like behaviour)
+Documentation=https://github.com/bitpoultry/ugreen-dxp480t-led
+After=zfs.target systemd-modules-load.service
+Wants=zfs.target
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/modprobe i2c-dev
+ExecStart=/usr/local/sbin/ugreen-power-led monitor
+# UGOS flashes white every 0.5 s while powering off. Stopping the unit at
+# shutdown/reboot gives that pattern until the power is cut.
+ExecStop=/usr/local/sbin/ugreen-power-led blink white 500 500
+Restart=on-failure
+RestartSec=30
+Nice=10
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

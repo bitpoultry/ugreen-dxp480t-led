@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Drive the power LED of a UGREEN NASync DXP480T (Plus) the way UGOS does.
+
+The LED is driven by a Nuvoton N76E003 MCU on the Intel I801 SMBus, address
+0x26 (0x31 on some units). The register sequences below mirror UGREEN's own
+GPL driver drivers/ugreen/dxp480t/leds-mcu-n76e003.c in
+github.com/ugreen-opensource/kernel-6.12, so no kernel module is needed.
+
+UGOS behaviour (DXP480T Plus manual):
+  white steady            running normally
+  white blink, 0.5 s      powering off
+  orange slow blink, 1 s  device error
+
+Usage:
+  ugreen-power-led status
+  ugreen-power-led steady white|orange
+  ugreen-power-led blink white|orange [ON_MS OFF_MS]
+  ugreen-power-led breath            (white only, as in UGOS)
+  ugreen-power-led off
+  ugreen-power-led monitor           (service mode: white steady, orange blink on faults)
+  ugreen-power-led check             (print health findings, no LED change)
+"""
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+ADDRESSES = (0x26, 0x31)          # candidate MCU addresses from the vendor driver
+CHIP_ID_SIGNATURE = (0xA5, 0xB5)  # registers 0x5A/0x5B
+
+REG_SET = 0xA0          # write bits: turn channel(s) on
+REG_CLEAR = 0xB1        # write bits: turn channel(s) off
+REG_MODE_WHITE = 0x50   # 0 steady, 1 timer (blink), 2 breath
+REG_MODE_ORANGE = 0x51
+REG_DELAY_ON = 0xC0     # u16 little endian; white at +0, orange at +2
+REG_DELAY_OFF = 0xD0
+REG_BRIGHTNESS = 0xE0   # 0xE0/0xE1, 2..254
+REG_FW_VERSION = 0x5D
+
+WHITE, ORANGE = 0x01, 0x02
+MODE_STEADY, MODE_TIMER, MODE_BREATH = 0, 1, 2
+
+LOCK_FILE = "/run/lock/ugreen-power-led.lock"
+POLL_SECONDS = 60
+SMART_EVERY = 5         # run the NVMe SMART check every Nth poll
+
+
+def run(cmd, timeout=60):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def find_bus():
+    out = run(["i2cdetect", "-l"]).stdout
+    for line in out.splitlines():
+        if "SMBus I801" in line:
+            return int(line.split()[0].replace("i2c-", ""))
+    raise SystemExit("Fant ingen SMBus I801-buss (er i2c-dev lastet?)")
+
+
+def i2c_get(bus, addr, reg):
+    r = run(["i2cget", "-y", str(bus), hex(addr), hex(reg), "b"])
+    if r.returncode != 0:
+        return None
+    return int(r.stdout.strip(), 16)
+
+
+def find_mcu(bus):
+    for addr in ADDRESSES:
+        sig = (i2c_get(bus, addr, 0x5A), i2c_get(bus, addr, 0x5B))
+        if sig == CHIP_ID_SIGNATURE:
+            return addr
+    raise SystemExit("Fant ikke LED-MCU-en (signatur 0xa5b5) på 0x26/0x31")
+
+
+class Led:
+    def __init__(self):
+        self.bus = find_bus()
+        self.addr = find_mcu(self.bus)
+
+    def w(self, reg, value):
+        r = run(["i2cset", "-y", str(self.bus), hex(self.addr), hex(reg), hex(value & 0xFF), "b"])
+        if r.returncode != 0:
+            raise RuntimeError(f"i2cset {hex(reg)}={hex(value)} feilet: {r.stderr.strip()}")
+        # The vendor driver waits 2 ms after set/clear and 10 ms after other writes.
+        time.sleep(0.005 if reg in (REG_SET, REG_CLEAR) else 0.015)
+
+    def r(self, reg):
+        return i2c_get(self.bus, self.addr, reg)
+
+    def _mode(self, color, mode):
+        # Same order as mcu_led_set_blink(): quiet the other channel, then set mode.
+        if color == WHITE:
+            self.w(REG_MODE_ORANGE, MODE_STEADY)
+            self.w(REG_CLEAR, ORANGE)
+            self.w(REG_MODE_WHITE, mode)
+        else:
+            self.w(REG_MODE_WHITE, MODE_STEADY)
+            self.w(REG_CLEAR, WHITE)
+            self.w(REG_MODE_ORANGE, mode)
+
+    def _on(self, color, brightness=None):
+        # Same as mcu_work(): clear the other channel, set ours, optional PWM level.
+        self.w(REG_CLEAR, ORANGE if color == WHITE else WHITE)
+        self.w(REG_SET, color)
+        if brightness is not None:
+            self.w(REG_BRIGHTNESS, brightness)
+            self.w(REG_BRIGHTNESS + 1, brightness)
+
+    def steady(self, color, brightness=254):
+        self._mode(color, MODE_STEADY)
+        self._on(color, brightness)
+
+    def blink(self, color, on_ms, off_ms):
+        on_ms = on_ms if on_ms >= 20 else 500
+        off_ms = off_ms if off_ms >= 20 else 500
+        self._mode(color, MODE_TIMER)
+        offset = 0 if color == WHITE else 2
+        self.w(REG_DELAY_ON + offset, on_ms & 0xFF)
+        self.w(REG_DELAY_ON + offset + 1, on_ms >> 8)
+        self.w(REG_DELAY_OFF + offset, off_ms & 0xFF)
+        self.w(REG_DELAY_OFF + offset + 1, off_ms >> 8)
+        self._on(color)
+
+    def breath(self):
+        self._mode(WHITE, MODE_BREATH)
+        self._on(WHITE)
+
+    def off(self):
+        self.w(REG_MODE_WHITE, MODE_STEADY)
+        self.w(REG_MODE_ORANGE, MODE_STEADY)
+        self.w(REG_CLEAR, WHITE | ORANGE)
+
+    def status(self):
+        def u16(reg):
+            lo, hi = self.r(reg), self.r(reg + 1)
+            return None if lo is None or hi is None else lo | hi << 8
+        modes = {0: "fast", 1: "blink", 2: "pust"}
+        return {
+            "buss": f"i2c-{self.bus}",
+            "adresse": hex(self.addr),
+            "firmware": f"v1.0.{self.r(REG_FW_VERSION)}",
+            "hvit_modus": modes.get(self.r(REG_MODE_WHITE), "?"),
+            "oransje_modus": modes.get(self.r(REG_MODE_ORANGE), "?"),
+            "hvit_blink_ms": [u16(REG_DELAY_ON), u16(REG_DELAY_OFF)],
+            "oransje_blink_ms": [u16(REG_DELAY_ON + 2), u16(REG_DELAY_OFF + 2)],
+            "lysstyrke": [self.r(REG_BRIGHTNESS), self.r(REG_BRIGHTNESS + 1)],
+        }
+
+
+def locked(fn):
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    with open(LOCK_FILE, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        return fn()
+
+
+# ---------------------------------------------------------------- health checks
+
+def check_zfs():
+    try:
+        r = run(["zpool", "status", "-x"])
+    except FileNotFoundError:
+        return []
+    text = r.stdout.strip()
+    if r.returncode != 0 or (text and text not in ("all pools are healthy", "no pools available")):
+        pools = re.findall(r"pool:\s*(\S+)", text) or ["?"]
+        return [f"ZFS-pool ikke frisk: {', '.join(pools)}"]
+    return []
+
+
+def check_nvme():
+    findings = []
+    for name in sorted(os.listdir("/sys/class/nvme")) if os.path.isdir("/sys/class/nvme") else []:
+        dev = f"/dev/{name}"
+        try:
+            r = run(["smartctl", "-H", "-A", "-j", dev])
+            data = json.loads(r.stdout or "{}")
+        except (FileNotFoundError, json.JSONDecodeError, subprocess.TimeoutExpired):
+            continue
+        passed = data.get("smart_status", {}).get("passed")
+        warn = data.get("nvme_smart_health_information_log", {}).get("critical_warning", 0)
+        if passed is False or warn:
+            findings.append(f"{name}: SMART passed={passed} critical_warning={warn}")
+    return findings
+
+
+def health(include_smart=True):
+    findings = check_zfs()
+    if include_smart:
+        findings += check_nvme()
+    return findings
+
+
+def monitor():
+    led = Led()
+    state, poll, smart_findings = None, 0, []
+    while True:
+        if poll % SMART_EVERY == 0:
+            smart_findings = check_nvme()
+        findings = check_zfs() + smart_findings
+        wanted = "fault" if findings else "ok"
+        if wanted != state:
+            if wanted == "fault":
+                locked(lambda: led.blink(ORANGE, 1000, 1000))
+                print("Feil oppdaget, oransje blink: " + "; ".join(findings), flush=True)
+            else:
+                locked(lambda: led.steady(WHITE))
+                print("Alt friskt, fast hvitt lys", flush=True)
+            state = wanted
+        poll += 1
+        time.sleep(POLL_SECONDS)
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    color = {"white": WHITE, "orange": ORANGE}
+    if cmd == "monitor":
+        monitor()
+    elif cmd == "check":
+        findings = health()
+        print("\n".join(findings) if findings else "Ingen feil funnet")
+        return 1 if findings else 0
+    led = Led()
+    if cmd == "status":
+        print(json.dumps(locked(led.status), indent=2, ensure_ascii=False))
+    elif cmd == "steady" and args and args[0] in color:
+        locked(lambda: led.steady(color[args[0]]))
+    elif cmd == "blink" and args and args[0] in color:
+        on_ms, off_ms = (int(args[1]), int(args[2])) if len(args) >= 3 else (500, 500)
+        locked(lambda: led.blink(color[args[0]], on_ms, off_ms))
+    elif cmd == "breath":
+        locked(led.breath)
+    elif cmd == "off":
+        locked(led.off)
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

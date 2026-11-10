@@ -1,0 +1,2 @@
+Unmodified copies of UGREEN GPL-2.0-or-later sources from
+https://github.com/ugreen-opensource/kernel-6.12/tree/c75c5abd60dd45f45966720293ce1ee505fb8615/drivers/ugreen/dxp480t
